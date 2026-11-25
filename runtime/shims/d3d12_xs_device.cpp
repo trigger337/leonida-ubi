@@ -698,7 +698,9 @@ DeviceProxy* dxgi_owner(void* self) {
 HRESULT host_adapter(ID3D12Device* real, REFIID riid, void** out) {
     using CreateFactoryFn = HRESULT(WINAPI*)(REFIID, void**);
     static const CreateFactoryFn create_factory = [] {
-        const HMODULE dxgi = LoadLibraryExA("dxgi.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+        HMODULE dxgi = GetModuleHandleA("dxgi.dll");
+        if (!dxgi) dxgi = LoadLibraryA("dxgi.dll");
+        if (!dxgi) dxgi = LoadLibraryExA("dxgi.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
         return dxgi ? reinterpret_cast<CreateFactoryFn>(
                           reinterpret_cast<void*>(GetProcAddress(dxgi, "CreateDXGIFactory1")))
                     : nullptr;

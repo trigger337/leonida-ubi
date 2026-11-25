@@ -28,7 +28,11 @@
 namespace {
 
 FARPROC host(const char* name) {
-    static HMODULE d3d12 = LoadLibraryExA("d3d12.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+    static HMODULE d3d12 = []() -> HMODULE {
+        if (HMODULE h = GetModuleHandleA("d3d12.dll")) return h;
+        if (HMODULE h = LoadLibraryA("d3d12.dll")) return h;
+        return LoadLibraryExA("d3d12.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
+    }();
     FARPROC p = d3d12 ? GetProcAddress(d3d12, name) : nullptr;
     if (!p) std::fprintf(stderr, "[rt] d3d12_xs: host d3d12.dll has no %s\n", name);
     return p;
@@ -56,10 +60,22 @@ bool host_serializes_1_2(SerializeFn fn) {
     return supported;
 }
 
+HRESULT WINAPI serialize_root_signature_legacy(const D3D12_ROOT_SIGNATURE_DESC* desc,
+                                               D3D_ROOT_SIGNATURE_VERSION version, ID3DBlob** blob,
+                                               ID3DBlob** error);
+
 HRESULT WINAPI serialize_root_signature(const D3D12_VERSIONED_ROOT_SIGNATURE_DESC* desc,
                                         ID3DBlob** blob, ID3DBlob** error) {
     static auto fn = reinterpret_cast<SerializeFn>(host("D3D12SerializeVersionedRootSignature"));
-    if (!fn) return E_NOTIMPL;
+    if (!fn) {
+        static auto legacy_fn = reinterpret_cast<LegacySerializeFn>(host("D3D12SerializeRootSignature"));
+        if (legacy_fn && desc && desc->Version == D3D_ROOT_SIGNATURE_VERSION_1_0) {
+            std::fprintf(stderr,
+                         "[rt] d3d12_xs: D3D12SerializeVersionedRootSignature: falling back to D3D12SerializeRootSignature\n");
+            return serialize_root_signature_legacy(&desc->Desc_1_0, D3D_ROOT_SIGNATURE_VERSION_1_0, blob, error);
+        }
+        return E_NOTIMPL;
+    }
     if (!desc) return fn(desc, blob, error);
 
     D3D12_VERSIONED_ROOT_SIGNATURE_DESC cleared{};
