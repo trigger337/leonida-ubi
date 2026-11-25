@@ -462,7 +462,7 @@ const char* slot_name(unsigned slot) {
         case 70: return "Xbox shader-resource view of placed memory";
         case 71: return "Xbox unordered-access view of placed memory";
         case 73: return "Xbox CreateCommandListX -> console list proxy";
-        case 74: return "Xbox (pointer, u32, pointer) stand-in";
+        case 74: return "Xbox RegisterPagePool (address, pages, handle out)";
         case 75: return "CreateCommandQueue1 -> queue proxy";
         case 76: return "Xbox resource creation";
         case 127: return "Xbox CreateCommittedResource3";
@@ -5626,16 +5626,62 @@ HRESULT proxy_create_placed_resource_slot133(DeviceProxy* self, std::uint64_t va
 
 // Slot 74: the retail title calls it once with (pointer, u32, pointer) (kapitche, issue 7231). The PC slot 74 is
 // ID3D12Device9::ShaderCacheControl(kinds, control), which reads the first word as a flags value and returns
-// E_INVALIDARG, and the title then stops on an int3. The words are not measured: nothing is written through the
-// pointers, the PC device is not called, and the call succeeds. Only for the title's calls (set_console_caller, as
-// slot 61): a host caller of ID3D12Device9::ShaderCacheControl through the proxy gets the PC method.
+// E_INVALIDARG, and the title then stops on an int3. Only for the title's calls (set_console_caller, as slot 61): a host
+// caller of ID3D12Device9::ShaderCacheControl through the proxy gets the PC method.
+//
+// For the title it is RegisterPagePool(address, page count, handle out), as VIctory reads it (Marvisak/VIctory,
+// GPL-3, crates/victory-gpu/src/resource.rs, register_page_pool, device method 0x250 = slot 74): a pool of 64 KiB
+// pages the title later maps into resources by page index. This is written anew from that reading. As VIctory does,
+// a null handle pointer, a page count of 0 or an address that is not 64 KiB aligned is refused with E_INVALIDARG and
+// nothing is written; an address of 0 and a handle pointer this process cannot write are refused the same way, since
+// the console method could not succeed on either and writing would fault. Otherwise the pool's {address, page count}
+// is recorded and a non-zero handle unique to this process is written as a 64-bit word (VIctory writes a usize).
+// Queue slot 31 (CopyPageMappingsBatchX) takes the pool's address and page count directly, so nothing looks a handle
+// up yet; console_page_pool (d3d12_xs_device.h) reads the record.
+// TODO(RT-SLOT74-POOL-HANDLE): VIctory reads the title's device method 0x258 (slot 75) as UnregisterPagePool(handle),
+// which frees the record; here slot 75 is still the PC ID3D12Device9::CreateCommandQueue1 for every caller.
+constexpr std::uint64_t kConsolePoolPageSize = 64 * 1024;
+
+struct ConsolePagePool {
+    std::uint64_t handle = 0;
+    std::uint64_t address = 0;
+    std::uint32_t pages = 0;
+};
+
+std::mutex g_page_pools_mutex;
+std::vector<ConsolePagePool> g_page_pools;  // under g_page_pools_mutex
+std::uint64_t g_next_page_pool_handle = 1;  // under g_page_pools_mutex; 0 is never a handle
+
+// True when the 8 bytes at `address` are committed memory this process can write, without touching them.
+bool handle_word_writable(std::uint64_t address) {
+    if (address == 0 || (address & 7) != 0) return false;  // a handle word is 8-byte aligned, so it sits in one page
+    MEMORY_BASIC_INFORMATION mbi{};
+    if (!VirtualQuery(reinterpret_cast<const void*>(address), &mbi, sizeof(mbi)) || mbi.State != MEM_COMMIT)
+        return false;
+    if (mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS)) return false;
+    const DWORD protect = mbi.Protect & 0xffu;
+    return protect == PAGE_READWRITE || protect == PAGE_WRITECOPY || protect == PAGE_EXECUTE_READWRITE ||
+           protect == PAGE_EXECUTE_WRITECOPY;
+}
+
 std::uint64_t proxy_slot74(std::uint64_t a1, std::uint64_t a2, std::uint64_t a3) {
+    const std::uint64_t address = a1;
+    const auto pages = static_cast<std::uint32_t>(a2);
     static std::atomic<bool> logged{false};
     bool expected = false;
     if (logged.compare_exchange_strong(expected, true, std::memory_order_relaxed))
-        std::fprintf(stderr, "[rt] d3d12_xs: slot 74 (pointer, u32, pointer) returns S_OK; words 0x%llx 0x%llx 0x%llx\n",
-                     static_cast<unsigned long long>(a1), static_cast<unsigned long long>(a2),
+        std::fprintf(stderr, "[rt] d3d12_xs: slot 74 (RegisterPagePool) first call: pool 0x%llx of %u pages, handle "
+                     "out 0x%llx\n", static_cast<unsigned long long>(address), pages,
                      static_cast<unsigned long long>(a3));
+    if (address == 0 || address % kConsolePoolPageSize != 0 || pages == 0 || !handle_word_writable(a3))
+        return hr_to_u64(E_INVALIDARG);
+    std::uint64_t handle = 0;
+    {
+        std::lock_guard<std::mutex> lock(g_page_pools_mutex);
+        handle = g_next_page_pool_handle++;
+        g_page_pools.push_back(ConsolePagePool{handle, address, pages});
+    }
+    *reinterpret_cast<std::uint64_t*>(a3) = handle;
     return hr_to_u64(S_OK);
 }
 
@@ -6674,6 +6720,17 @@ std::uint64_t allocator_table_overruns() {
 
 bool heap_slot_overridden(unsigned slot) {
     return slot <= 2 || slot == 7 || slot == 9 || slot == 10;
+}
+
+bool console_page_pool(std::uint64_t handle, std::uint64_t* address, std::uint32_t* pages) {
+    std::lock_guard<std::mutex> lock(g_page_pools_mutex);
+    for (const ConsolePagePool& pool : g_page_pools) {
+        if (pool.handle != handle) continue;
+        if (address) *address = pool.address;
+        if (pages) *pages = pool.pages;
+        return true;
+    }
+    return false;
 }
 
 void set_console_caller(ConsoleCaller classify) {

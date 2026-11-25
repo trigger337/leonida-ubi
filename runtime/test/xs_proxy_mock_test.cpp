@@ -2700,27 +2700,46 @@ int check_slot70() {
     return 0;
 }
 
-// ---- 8b. Device slot 74: (pointer, u32, pointer) succeeds and touches nothing, never the PC ShaderCacheControl ----
+// ---- 8b. Device slot 74: the title's RegisterPagePool writes a handle; never the PC ShaderCacheControl ----
 
 int check_slot74() {
     // Level 9 has the PC slot 74 (ShaderCacheControl); level 0 does not (44 PC slots). Neither may reach it.
+    constexpr std::uint64_t kPool = 0x7ff600000000ull;  // 64 KiB aligned; the pool itself is never read or written
     for (const int level : {9, 0}) {
         Mock* mock = nullptr;
         void* device = make_device(mock, level, true);
         EXPECT(device && xs::device_slot_overridden(74));
         xs::reset_device_proxy_stats();
-        std::uint32_t first[4] = {0x11111111, 0x22222222, 0x33333333, 0x44444444};
-        std::uint32_t second[4] = {0x55555555, 0x66666666, 0x77777777, 0x88888888};
-        const std::uint32_t first_before[4] = {first[0], first[1], first[2], first[3]};
-        const std::uint32_t second_before[4] = {second[0], second[1], second[2], second[3]};
-        // The title's call (a caller the classifier takes for a guest image): the stand-in.
+        // The title's call (a caller the classifier takes for a guest image): RegisterPagePool(address, pages, out).
         xs::set_console_caller([](std::uint64_t) { return true; });
-        EXPECT(hr_of(raw(device, 74, word(first), 7, word(second))) == S_OK);
-        EXPECT(mock->calls[74] == 0 && xs::device_slot_hits(74) == 1);
-        EXPECT(std::memcmp(first, first_before, sizeof(first)) == 0 && std::memcmp(second, second_before, sizeof(second)) == 0);
+        std::uint64_t first = 0, second = 0;
+        EXPECT(hr_of(raw(device, 74, kPool, 16, word(&first))) == S_OK);
+        EXPECT(hr_of(raw(device, 74, kPool + 0x10000, 1, word(&second))) == S_OK);
+        EXPECT(first != 0 && second != 0 && first != second);
+        std::uint64_t address = 0;
+        std::uint32_t pages = 0;
+        EXPECT(xs::console_page_pool(first, &address, &pages) && address == kPool && pages == 16);
+        EXPECT(xs::console_page_pool(second, &address, &pages) && address == kPool + 0x10000 && pages == 1);
+        EXPECT(!xs::console_page_pool(0, nullptr, nullptr));
+        EXPECT(mock->calls[74] == 0 && xs::device_slot_hits(74) == 2);
+        // Refused with E_INVALIDARG, nothing written and nothing recorded: no handle pointer, a handle pointer this
+        // process cannot write (a read-only page), no pages, an address of 0 or not 64 KiB aligned.
+        void* const read_only = VirtualAlloc(nullptr, 4096, MEM_COMMIT | MEM_RESERVE, PAGE_READONLY);
+        EXPECT(read_only);
+        constexpr std::uint64_t kUntouched = 0xA5A5A5A5A5A5A5A5ull;
+        std::uint64_t out = kUntouched;
+        EXPECT(hr_of(raw(device, 74, kPool, 16, 0)) == E_INVALIDARG);
+        EXPECT(hr_of(raw(device, 74, kPool, 16, word(read_only))) == E_INVALIDARG);
+        EXPECT(*static_cast<const std::uint64_t*>(read_only) == 0);
+        EXPECT(hr_of(raw(device, 74, kPool, 0, word(&out))) == E_INVALIDARG && out == kUntouched);
+        EXPECT(hr_of(raw(device, 74, 0, 16, word(&out))) == E_INVALIDARG && out == kUntouched);
+        EXPECT(hr_of(raw(device, 74, kPool + 0x1000, 16, word(&out))) == E_INVALIDARG && out == kUntouched);
+        EXPECT(VirtualFree(read_only, 0, MEM_RELEASE) != FALSE);
+        EXPECT(!xs::console_page_pool(second + 1, nullptr, nullptr));  // the refusals took no handle
+        EXPECT(mock->calls[74] == 0);
         // A host caller, under a classifier and with none installed: the PC slot 74 (ShaderCacheControl) with the
         // same words where the PC device has it, and the refusal past its table where it does not (found on Windows
-        // in the review of this change: the stand-in used to take a host's ShaderCacheControl too).
+        // in the review of #385: the stand-in used to take a host's ShaderCacheControl too). Nothing is registered.
         for (const bool installed : {true, false}) {
             if (installed)
                 xs::set_console_caller([](std::uint64_t) { return false; });
@@ -2735,6 +2754,7 @@ int check_slot74() {
                 EXPECT(hr == E_NOTIMPL && mock->calls[74] == before);
             }
         }
+        EXPECT(!xs::console_page_pool(second + 1, nullptr, nullptr));
         xs::set_console_caller(nullptr);
         EXPECT(release(device) == 0 && mock->refs == 0);
     }

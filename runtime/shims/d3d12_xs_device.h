@@ -36,8 +36,10 @@
 //             R32_TYPELESS, BUFFER and RAW followed at once by a D3D12_GPU_VIRTUAL_ADDRESS) the device's resource
 //             provider, which names the buffer a slot-133 call registered for that address.
 //   slot 71   the same for an unordered-access view. The PC slot 71 is CreateSamplerFeedbackUnorderedAccessView.
-//   slot 74   (pointer, u32, pointer): not measured, returns S_OK. The PC slot 74 is ShaderCacheControl(kinds, control),
-//             which reads the first word as flags and returns E_INVALIDARG. Nothing is written, the PC device is not called.
+//   slot 74   RegisterPagePool(address, pages, handle out), as VIctory reads it, for a console caller: records the pool
+//             and writes a non-zero handle (console_page_pool); E_INVALIDARG and no write for a null or unwritable
+//             handle pointer, 0 pages or an address that is 0 or not 64 KiB aligned. The PC slot 74 is
+//             ShaderCacheControl(kinds, control), which any other caller still gets.
 //   slot 76   resource creation -> PC CreateCommittedResource (PC slot 27), with the Xbox layout word ignored.
 //   slot 127  CreateCommittedResource3 (heap, flags, desc1, layout, clear, session, castable count/list, riid, out) ->
 //             PC ID3D12Device10::CreateCommittedResource3 (PC slot 76), with the Xbox layout word replaced and the
@@ -349,6 +351,10 @@ void set_console_caller(ConsoleCaller classify);
 // True on the calling thread while the proxy forwards a CheckFeatureSupport (device slot 13) that a console caller
 // made, so the device behind it can answer the console's formats.
 bool console_feature_query() noexcept;
+
+// The page pools the title registered through device slot 74 (RegisterPagePool, for a console caller): true, with the
+// pool's first address and page count, for a handle slot 74 wrote; false for any other word, 0 included.
+bool console_page_pool(std::uint64_t handle, std::uint64_t* address, std::uint32_t* pages);
 
 // Queue and fence proxies created by device slots 8/75 and 36. The real_* accessors return the wrapped object
 // (no reference added), or null when the pointer is not such a proxy.
